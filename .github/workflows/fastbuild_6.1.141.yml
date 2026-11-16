@@ -66,10 +66,10 @@ on:
         type: boolean
         default: 'false'
       ssg_enable:
-        description: '是否启用三星SSG IO调度器支持(提升IO读写性能; 在一加12上可能导致bug)'
+        description: '是否启用三星SSG IO调度器支持(提升IO读写性能; README 已注明：一加12 上会导致无法正常启动，默认关闭)'
         required: true
         type: boolean
-        default: 'true'
+        default: 'false'
       rekernel_enable:
         description: '是否启用Re-Kernel支持(与Freezer/NoActive等软件配合, 提升应用冻结能力)'
         required: true
@@ -301,6 +301,13 @@ jobs:
             cd ./common
             patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
             patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+            # 50_ 补丁在 security/selinux/{hooks,selinuxfs}.c 里引用 &fake_state，
+            # 该符号只在 ksu_type=ksu 时由 KernelSU 侧补丁（10_enable_susfs_for_ksu.patch）定义；
+            # BakaSU 新版 selinux_hide.c 已改用 fake_status 机制，不再定义它
+            # → 非 ksu 路径下改回真实的 selinux_state，否则链接期 undefined symbol: fake_state
+            if [[ ${{ github.event.inputs.ksu_type }} != "ksu" ]]; then
+              sed -i 's/&fake_state/\&selinux_state/g' security/selinux/hooks.c security/selinux/selinuxfs.c
+            fi
             cd ..
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
@@ -652,9 +659,18 @@ jobs:
           wget https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux
           wget https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux
           chmod +x ./kptools-linux
+          MAGIC0=$(od -An -tx1 -j56 -N4 ./Image | tr -d ' \n')
           ./kptools-linux -p -i ./Image -k ./kpimg-linux -o ./oImage
           rm -f Image
           mv oImage Image
+          # arm64 Image 头在偏移 0x38 的魔数是 0x644d5241（小端字节序列 41 52 4d 64）；
+          # kptools 打坏镜像时这里会变，打出来的包刷上去就是黑屏
+          MAGIC1=$(od -An -tx1 -j56 -N4 ./Image | tr -d ' \n')
+          echo "Image 头魔数：修补前=$MAGIC0 修补后=$MAGIC1"
+          if [[ "$MAGIC0" == "41524d64" && "$MAGIC1" != "41524d64" ]]; then
+            echo "::error title=KPM 把 Image 改坏了::修补前是正常 arm64 Image(41524d64)，修补后变成 $MAGIC1，这个包刷上去必然黑屏"
+            exit 1
+          fi
           
       - name: 克隆 AnyKernel3 并打包
         id: create_zip
@@ -666,6 +682,14 @@ jobs:
           cp ../common/out/arch/arm64/boot/Image ./Image
           if [[ ! -f ./Image ]]; then
             echo "未找到内核镜像文件，构建可能出错"
+            exit 1
+          fi
+          # 打包前再验一次：确认是合法 arm64 Image（偏移 0x38 魔数 41524d64）
+          IMG_MAGIC=$(od -An -tx1 -j56 -N4 ./Image | tr -d ' \n')
+          IMG_SIZE=$(stat -c %s ./Image)
+          echo "待打包 Image：${IMG_SIZE} 字节，头魔数=${IMG_MAGIC}"
+          if [[ "$IMG_MAGIC" != "41524d64" ]]; then
+            echo "::error title=Image 不是合法 arm64 内核::魔数=$IMG_MAGIC 大小=$IMG_SIZE，这个包刷上去必然黑屏"
             exit 1
           fi
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
